@@ -175,9 +175,16 @@ if STORAGE_BACKEND == "s3":
     if not (AWS_STORAGE_BUCKET_NAME and AWS_PRIVATE_BUCKET_NAME):
         raise RuntimeError("STORAGE_BACKEND=s3 requires AWS_STORAGE_BUCKET_NAME and AWS_PRIVATE_BUCKET_NAME.")
     AWS_S3_CUSTOM_DOMAIN = env("AWS_S3_CUSTOM_DOMAIN", "")  # e.g. www.example.co.ke (CloudFront)
+    # S3-compatible providers (e.g. Supabase Storage): set the endpoint and use path-style
+    # addressing. Access keys are then read from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
+    AWS_S3_ENDPOINT_URL = env("AWS_S3_ENDPOINT_URL", "") or None
+    AWS_S3_ADDRESSING_STYLE = env("AWS_S3_ADDRESSING_STYLE", "path" if AWS_S3_ENDPOINT_URL else "auto")
+    AWS_S3_SIGNATURE_VERSION = "s3v4"
     AWS_DEFAULT_ACL = None
     AWS_S3_FILE_OVERWRITE = False
-    AWS_S3_OBJECT_PARAMETERS = {"ServerSideEncryption": "AES256"}
+    # AES256 server-side encryption is an AWS feature; disable it for providers that reject the header.
+    AWS_S3_OBJECT_PARAMETERS = ({"ServerSideEncryption": "AES256"}
+                                if env_bool("AWS_S3_SERVER_SIDE_ENCRYPTION", not AWS_S3_ENDPOINT_URL) else {})
     STORAGES = {
         "default": {
             "BACKEND": "storages.backends.s3.S3Storage",
@@ -389,6 +396,7 @@ if TESTING:
     MEDIA_ROOT = Path(env("TEST_MEDIA_ROOT", BASE_DIR / "test_media"))
     PRIVATE_MEDIA_ROOT = Path(env("TEST_PRIVATE_MEDIA_ROOT", BASE_DIR / "test_private_media"))
     EMAIL_BACKEND = "django.core.mail.backends.locmem.EmailBackend"
+    NOTIFICATIONS["EMAIL_ENABLED"] = False  # tests never depend on a developer's local email setup
     REST_FRAMEWORK["DEFAULT_THROTTLE_CLASSES"] = []
     MPESA["MODE"] = "simulated"
     LOGGING["root"]["level"] = "ERROR"

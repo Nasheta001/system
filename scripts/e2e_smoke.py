@@ -88,7 +88,8 @@ check("landlord number not on public API", "112157383" not in requests.get(f"{BA
 detail = requests.get(f"{BASE}/api/public/properties/{props[0]['slug']}/").json()
 check("property detail has units & photos", "units" in detail and len(detail["photos"]) > 0)
 check("public detail exposes no tenant data", "tenant" not in str(detail).lower())
-photo = requests.get(detail["photos"][0]["url"].replace("http://localhost:4200", BASE))
+u = detail["photos"][0]["url"]
+photo = requests.get(u if u.startswith("http") else BASE + u)
 check("property photo served via /media", photo.status_code == 200 and photo.headers["Content-Type"].startswith("image"))
 
 anon = session()

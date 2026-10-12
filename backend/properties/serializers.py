@@ -3,6 +3,12 @@ from rest_framework import serializers
 from .models import Amenity, Building, Property, PropertyOwnership, PropertyPhoto, Unit, UnitType
 
 
+def media_url(url):
+    """Site-relative for local storage (/media/...), so the SPA's own domain serves it (directly or
+    through its proxy); absolute URLs from object storage are returned unchanged."""
+    return url
+
+
 class AmenitySerializer(serializers.ModelSerializer):
     class Meta:
         model = Amenity
@@ -24,9 +30,8 @@ class PhotoSerializer(serializers.ModelSerializer):
         extra_kwargs = {"image": {"write_only": True}}
 
     def get_url(self, obj):
-        request = self.context.get("request")
         url = obj.image.url
-        return request.build_absolute_uri(url) if request else url
+        return media_url(url)
 
     def validate_image(self, f):
         from config.validators import sanitize_image, validate_image_upload
@@ -131,9 +136,8 @@ class PropertyListSerializer(serializers.ModelSerializer):
         photos = list(obj.photos.all())
         if not photos:
             return None
-        request = self.context.get("request")
         url = photos[0].image.url
-        return request.build_absolute_uri(url) if request else url
+        return media_url(url)
 
 
 class PropertyDetailSerializer(serializers.ModelSerializer):
@@ -176,8 +180,7 @@ class PublicPhotoSerializer(serializers.ModelSerializer):
         fields = ["id", "url", "caption", "unit"]
 
     def get_url(self, obj):
-        request = self.context.get("request")
-        return request.build_absolute_uri(obj.image.url) if request else obj.image.url
+        return media_url(obj.image.url)
 
 
 class PublicUnitSerializer(serializers.ModelSerializer):
@@ -217,8 +220,7 @@ class PublicPropertyListSerializer(serializers.ModelSerializer):
         photos = [p for p in obj.photos.all() if p.unit_id is None] or list(obj.photos.all())
         if not photos:
             return None
-        request = self.context.get("request")
-        return request.build_absolute_uri(photos[0].image.url) if request else photos[0].image.url
+        return media_url(photos[0].image.url)
 
 
 class PublicPropertyDetailSerializer(serializers.ModelSerializer):
