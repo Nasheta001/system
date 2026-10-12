@@ -1,0 +1,887 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Property management platform - production stack (VPC, RDS PostgreSQL, S3,
+  ECS Fargate web + worker, ALB, CloudFront, Secrets Manager, CloudWatch).
+  Validated with cfn-lint only. NOT YET DEPLOYED OR TESTED IN AN AWS ACCOUNT.
+  See docs/AWS_DEPLOYMENT.md before use.
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: Public hostname, e.g. www.example.co.ke (DNS CNAME/ALIAS to CloudFront).
+  CloudFrontCertificateArn:
+    Type: String
+    Description: ACM certificate for DomainName in us-east-1 (required by CloudFront).
+  AlbCertificateArn:
+    Type: String
+    Description: ACM certificate for DomainName in THIS region (used on the ALB origin).
+  WebAclArn:
+    Type: String
+    Default: ""
+    Description: Optional WAF web ACL ARN from waf-us-east-1.yaml.
+  CloudFrontPrefixListId:
+    Type: String
+    Description: >-
+      Managed prefix list id for "com.amazonaws.global.cloudfront.origin-facing" in this region
+      (aws ec2 describe-managed-prefix-lists). Only CloudFront may reach the ALB.
+  ImageUri:
+    Type: String
+    Description: Backend image, e.g. 123456789012.dkr.ecr.af-south-1.amazonaws.com/propman-backend:2026-10-12-1
+  MigrateImageUri:
+    Type: String
+    Default: ""
+    Description: Used by the deploy script to run migrations with a new image before the services switch to it. Leave empty.
+  DBEngineVersion:
+    Type: String
+    Default: "17.11"
+    Description: Exact PostgreSQL 17 minor version available in your region (aws rds describe-db-engine-versions --engine postgres).
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.small
+  DBAllocatedStorage:
+    Type: Number
+    Default: 50
+  DBMultiAZ:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+  DBBackupRetentionDays:
+    Type: Number
+    Default: 14
+    MinValue: 1
+    MaxValue: 35
+  WebDesiredCount:
+    Type: Number
+    Default: 2
+    Description: Use 0 on the very first deployment (before secrets are set and migrations have run).
+  WorkerDesiredCount:
+    Type: Number
+    Default: 1
+    AllowedValues: [0, 1]
+    Description: Exactly one worker runs the scheduled jobs. Use 0 on the very first deployment.
+  MpesaMode:
+    Type: String
+    AllowedValues: [disabled, simulated, sandbox, production]
+    Default: disabled
+    Description: Keep "disabled" until Daraja credentials are stored in the AppSecret.
+  MpesaShortcode:
+    Type: String
+    Default: "174379"
+    Description: Paybill or till number (174379 = Daraja sandbox).
+  MpesaTransactionType:
+    Type: String
+    AllowedValues: [CustomerPayBillOnline, CustomerBuyGoodsOnline]
+    Default: CustomerPayBillOnline
+  MpesaAllowedCallbackIps:
+    Type: String
+    Default: ""
+    Description: Comma-separated Safaricom callback source IPs (obtain the current list from Safaricom). Empty = token + STK query checks only.
+  NotifyEmailEnabled:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: Set "true" once SES is verified and SMTP credentials are stored in the AppSecret.
+  DefaultFromEmail:
+    Type: String
+    Default: no-reply@example.co.ke
+  NumProxies:
+    Type: Number
+    Default: 2
+    Description: Proxies appending X-Forwarded-For before Django (CloudFront + ALB = 2).
+  AlertEmail:
+    Type: String
+    Description: Email address for CloudWatch alarm notifications (confirm the SNS subscription).
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+
+Conditions:
+  HasWaf: !Not [!Equals [!Ref WebAclArn, ""]]
+  HasMigrateImage: !Not [!Equals [!Ref MigrateImageUri, ""]]
+
+Resources:
+  # ------------------------------------------------------------------ network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.40.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: propman }]
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref InternetGateway }
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: propman-public-a }]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: propman-public-b }]
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: propman-private-a }]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: propman-private-b }]
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties: { RouteTableId: !Ref PublicRouteTable, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref InternetGateway }
+  PublicAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
+  PublicAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
+  # Containers need outbound internet for M-Pesa, SMS, email and AWS APIs.
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties: { Domain: vpc }
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties: { AllocationId: !GetAtt NatEip.AllocationId, SubnetId: !Ref PublicSubnetA }
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties: { RouteTableId: !Ref PrivateRouteTable, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref NatGateway }
+  PrivateAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTable }
+  PrivateAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTable }
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - HTTPS from CloudFront only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, SourcePrefixListId: !Ref CloudFrontPrefixListId }
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS tasks - port 8000 from the ALB only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8000, ToPort: 8000, SourceSecurityGroupId: !Ref AlbSecurityGroup }
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL - from ECS tasks only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref AppSecurityGroup }
+
+  # ------------------------------------------------------------------ secrets
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: propman/app
+      Description: >-
+        Application secrets. DJANGO_SECRET_KEY is generated. Replace every SET_ME value
+        (FIELD_ENCRYPTION_KEYS must be a Fernet key) before starting the services.
+      GenerateSecretString:
+        SecretStringTemplate: >-
+          {"FIELD_ENCRYPTION_KEYS":"SET_ME","MPESA_CONSUMER_KEY":"","MPESA_CONSUMER_SECRET":"",
+          "MPESA_PASSKEY":"","EMAIL_HOST_USER":"","EMAIL_HOST_PASSWORD":"","AFRICASTALKING_API_KEY":"",
+          "WHATSAPP_TOKEN":"","TURNSTILE_SECRET_KEY":""}
+        GenerateStringKey: DJANGO_SECRET_KEY
+        PasswordLength: 64
+        ExcludeCharacters: "\"'\\$`"
+  OriginVerifySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: propman/origin-verify
+      Description: Shared secret CloudFront sends to the ALB (X-Origin-Verify).
+      GenerateSecretString: { PasswordLength: 48, ExcludePunctuation: true }
+  MpesaCallbackSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: propman/mpesa-callback-token
+      Description: Secret path segment of the M-Pesa callback URL.
+      GenerateSecretString: { PasswordLength: 48, ExcludePunctuation: true }
+
+  # ------------------------------------------------------------------ database
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: propman private subnets
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+  DbParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Family: postgres17
+      Description: Force TLS for all connections
+      Parameters:
+        rds.force_ssl: "1"
+        log_min_duration_statement: "1000"
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: postgres
+      EngineVersion: !Ref DBEngineVersion
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref DBAllocatedStorage
+      MaxAllocatedStorage: 500
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: propman
+      MasterUsername: propman
+      ManageMasterUserPassword: true
+      MultiAZ: !Ref DBMultiAZ
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      DBParameterGroupName: !Ref DbParameterGroup
+      PubliclyAccessible: false
+      BackupRetentionPeriod: !Ref DBBackupRetentionDays
+      PreferredBackupWindow: "23:00-23:45"
+      PreferredMaintenanceWindow: "sun:00:30-sun:01:30"
+      DeletionProtection: true
+      CopyTagsToSnapshot: true
+      AutoMinorVersionUpgrade: true
+      EnablePerformanceInsights: true
+      EnableCloudwatchLogsExports: [postgresql]
+
+  # ------------------------------------------------------------------ storage
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 } }]
+      OwnershipControls: { Rules: [{ ObjectOwnership: BucketOwnerEnforced }] }
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 } }]
+      OwnershipControls: { Rules: [{ ObjectOwnership: BucketOwnerEnforced }] }
+      VersioningConfiguration: { Status: Enabled }
+  PrivateFilesBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 } }]
+      OwnershipControls: { Rules: [{ ObjectOwnership: BucketOwnerEnforced }] }
+      VersioningConfiguration: { Status: Enabled }
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 90 }
+  DenyInsecureTransportPrivate:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PrivateFilesBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt PrivateFilesBucket.Arn, !Sub "${PrivateFilesBucket.Arn}/*"]
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  # ------------------------------------------------------------------ CloudFront
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub propman-oac-${AWS::StackName}
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  SpaRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub propman-spa-rewrite-${AWS::StackName}
+      AutoPublish: true
+      FunctionConfig: { Comment: Serve index.html for Angular routes, Runtime: cloudfront-js-2.0 }
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+          if (!uri.includes('.') ) { request.uri = '/index.html'; }
+          return request;
+        }
+  SecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub propman-security-headers-${AWS::StackName}
+        SecurityHeadersConfig:
+          ContentSecurityPolicy:
+            Override: true
+            ContentSecurityPolicy: >-
+              default-src 'self'; script-src 'self' https://challenges.cloudflare.com;
+              style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;
+              img-src 'self' data: blob:; connect-src 'self'; frame-src https://challenges.cloudflare.com;
+              frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'; upgrade-insecure-requests
+          StrictTransportSecurity: { Override: true, AccessControlMaxAgeSec: 31536000, IncludeSubdomains: true, Preload: false }
+          ContentTypeOptions: { Override: true }
+          FrameOptions: { Override: true, FrameOption: DENY }
+          ReferrerPolicy: { Override: true, ReferrerPolicy: strict-origin-when-cross-origin }
+        CustomHeadersConfig:
+          Items:
+            - { Header: Permissions-Policy, Value: "camera=(), microphone=(), geolocation=(), payment=(), usb=()", Override: true }
+            - { Header: Cross-Origin-Opener-Policy, Value: same-origin, Override: true }
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2and3
+        Aliases: [!Ref DomainName]
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_All
+        WebACLId: !If [HasWaf, !Ref WebAclArn, !Ref AWS::NoValue]
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CloudFrontCertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: frontend
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+          - Id: media
+            DomainName: !GetAtt MediaBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+          - Id: api
+            DomainName: !GetAtt LoadBalancer.DNSName
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: 60
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Sub "{{resolve:secretsmanager:${OriginVerifySecret}}}"
+        DefaultCacheBehavior:
+          TargetOriginId: frontend
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6      # Managed-CachingOptimized
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+          FunctionAssociations:
+            - { EventType: viewer-request, FunctionARN: !GetAtt SpaRewriteFunction.FunctionMetadata.FunctionARN }
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad    # Managed-CachingDisabled
+            OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3  # Managed-AllViewer
+            Compress: true
+          - PathPattern: /django-admin/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+          - PathPattern: /static/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+            OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+            Compress: true
+          - PathPattern: /media/*
+            TargetOriginId: media
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+            ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+            Compress: true
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition: { StringEquals: { "AWS:SourceArn": !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}" } }
+  MediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MediaBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontReadPublicMediaOnly
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${MediaBucket.Arn}/media/*"
+            Condition: { StringEquals: { "AWS:SourceArn": !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}" } }
+
+  # ------------------------------------------------------------------ load balancer
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      LoadBalancerAttributes:
+        - { Key: routing.http.drop_invalid_header_fields.enabled, Value: "true" }
+        - { Key: idle_timeout.timeout_seconds, Value: "65" }
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8000
+      HealthCheckPath: /api/health/
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates: [{ CertificateArn: !Ref AlbCertificateArn }]
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref TargetGroup }]
+
+  # ------------------------------------------------------------------ containers
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterSettings: [{ Name: containerInsights, Value: enabled }]
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /propman/backend
+      RetentionInDays: !Ref LogRetentionDays
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement: [{ Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [!Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"]
+      Policies:
+        - PolicyName: read-secrets
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref AppSecret, !Ref MpesaCallbackSecret, !Ref OriginVerifySecret, !GetAtt Database.MasterUserSecret.SecretArn]
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement: [{ Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: app-files
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: [!Sub "${MediaBucket.Arn}/media/*", !Sub "${PrivateFilesBucket.Arn}/private/*"]
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: [!GetAtt MediaBucket.Arn, !GetAtt PrivateFilesBucket.Arn]
+        - PolicyName: ecs-exec
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [ssmmessages:CreateControlChannel, ssmmessages:CreateDataChannel, ssmmessages:OpenControlChannel, ssmmessages:OpenDataChannel]
+                Resource: "*"
+        - PolicyName: send-email
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: [ses:SendEmail, ses:SendRawEmail]
+                Resource: "*"
+
+  WebTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: propman-web
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "512"
+      Memory: "1024"
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref ImageUri
+          Command: [web]
+          Essential: true
+          ReadonlyRootFilesystem: false
+          PortMappings: [{ ContainerPort: 8000, Protocol: tcp }]
+          HealthCheck:
+            Command: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health/', timeout=4).status == 200 else 1)\""]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 30
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: web
+          Environment:
+            - { Name: DJANGO_DEBUG, Value: "false" }
+            - { Name: DJANGO_ALLOWED_HOSTS, Value: !Ref DomainName }
+            - { Name: CSRF_TRUSTED_ORIGINS, Value: !Sub "https://${DomainName}" }
+            - { Name: FRONTEND_URL, Value: !Sub "https://${DomainName}" }
+            - { Name: SECURE_HTTPS, Value: "true" }
+            - { Name: NUM_PROXIES, Value: !Ref NumProxies }
+            - { Name: CACHE_BACKEND, Value: db }
+            - { Name: LOG_FORMAT, Value: json }
+            - { Name: DB_HOST, Value: !GetAtt Database.Endpoint.Address }
+            - { Name: DB_PORT, Value: !GetAtt Database.Endpoint.Port }
+            - { Name: DB_NAME, Value: propman }
+            - { Name: DB_USER, Value: propman }
+            - { Name: DB_SSL_REQUIRE, Value: "true" }
+            - { Name: STORAGE_BACKEND, Value: s3 }
+            - { Name: AWS_STORAGE_BUCKET_NAME, Value: !Ref MediaBucket }
+            - { Name: AWS_PRIVATE_BUCKET_NAME, Value: !Ref PrivateFilesBucket }
+            - { Name: AWS_S3_REGION_NAME, Value: !Ref AWS::Region }
+            - { Name: AWS_S3_CUSTOM_DOMAIN, Value: !Ref DomainName }
+            - { Name: MPESA_MODE, Value: !Ref MpesaMode }
+            - { Name: MPESA_CALLBACK_BASE_URL, Value: !Sub "https://${DomainName}" }
+            - { Name: MPESA_ALLOWED_CALLBACK_IPS, Value: !Ref MpesaAllowedCallbackIps }
+            - { Name: MPESA_SHORTCODE, Value: !Ref MpesaShortcode }
+            - { Name: MPESA_TRANSACTION_TYPE, Value: !Ref MpesaTransactionType }
+            - { Name: NOTIFY_EMAIL_ENABLED, Value: !Ref NotifyEmailEnabled }
+            - { Name: EMAIL_BACKEND, Value: django.core.mail.backends.smtp.EmailBackend }
+            - { Name: EMAIL_HOST, Value: !Sub "email-smtp.${AWS::Region}.amazonaws.com" }
+            - { Name: EMAIL_PORT, Value: "587" }
+            - { Name: DEFAULT_FROM_EMAIL, Value: !Ref DefaultFromEmail }
+          Secrets:
+            - { Name: DB_PASSWORD, ValueFrom: !Sub "${Database.MasterUserSecret.SecretArn}:password::" }
+            - { Name: DJANGO_SECRET_KEY, ValueFrom: !Sub "${AppSecret}:DJANGO_SECRET_KEY::" }
+            - { Name: FIELD_ENCRYPTION_KEYS, ValueFrom: !Sub "${AppSecret}:FIELD_ENCRYPTION_KEYS::" }
+            - { Name: MPESA_CONSUMER_KEY, ValueFrom: !Sub "${AppSecret}:MPESA_CONSUMER_KEY::" }
+            - { Name: MPESA_CONSUMER_SECRET, ValueFrom: !Sub "${AppSecret}:MPESA_CONSUMER_SECRET::" }
+            - { Name: MPESA_PASSKEY, ValueFrom: !Sub "${AppSecret}:MPESA_PASSKEY::" }
+            - { Name: EMAIL_HOST_USER, ValueFrom: !Sub "${AppSecret}:EMAIL_HOST_USER::" }
+            - { Name: EMAIL_HOST_PASSWORD, ValueFrom: !Sub "${AppSecret}:EMAIL_HOST_PASSWORD::" }
+            - { Name: AFRICASTALKING_API_KEY, ValueFrom: !Sub "${AppSecret}:AFRICASTALKING_API_KEY::" }
+            - { Name: WHATSAPP_TOKEN, ValueFrom: !Sub "${AppSecret}:WHATSAPP_TOKEN::" }
+            - { Name: TURNSTILE_SECRET_KEY, ValueFrom: !Sub "${AppSecret}:TURNSTILE_SECRET_KEY::" }
+            - { Name: MPESA_CALLBACK_TOKEN, ValueFrom: !Ref MpesaCallbackSecret }
+            - { Name: ORIGIN_VERIFY_SECRET, ValueFrom: !Ref OriginVerifySecret }
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: propman-worker
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref ImageUri
+          Command: [worker]
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options: { awslogs-group: !Ref LogGroup, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: worker }
+          Environment:
+            - { Name: DJANGO_DEBUG, Value: "false" }
+            - { Name: DJANGO_ALLOWED_HOSTS, Value: !Ref DomainName }
+            - { Name: CSRF_TRUSTED_ORIGINS, Value: !Sub "https://${DomainName}" }
+            - { Name: FRONTEND_URL, Value: !Sub "https://${DomainName}" }
+            - { Name: SECURE_HTTPS, Value: "true" }
+            - { Name: NUM_PROXIES, Value: !Ref NumProxies }
+            - { Name: CACHE_BACKEND, Value: db }
+            - { Name: LOG_FORMAT, Value: json }
+            - { Name: DB_HOST, Value: !GetAtt Database.Endpoint.Address }
+            - { Name: DB_PORT, Value: !GetAtt Database.Endpoint.Port }
+            - { Name: DB_NAME, Value: propman }
+            - { Name: DB_USER, Value: propman }
+            - { Name: DB_SSL_REQUIRE, Value: "true" }
+            - { Name: STORAGE_BACKEND, Value: s3 }
+            - { Name: AWS_STORAGE_BUCKET_NAME, Value: !Ref MediaBucket }
+            - { Name: AWS_PRIVATE_BUCKET_NAME, Value: !Ref PrivateFilesBucket }
+            - { Name: AWS_S3_REGION_NAME, Value: !Ref AWS::Region }
+            - { Name: AWS_S3_CUSTOM_DOMAIN, Value: !Ref DomainName }
+            - { Name: MPESA_MODE, Value: !Ref MpesaMode }
+            - { Name: MPESA_CALLBACK_BASE_URL, Value: !Sub "https://${DomainName}" }
+            - { Name: MPESA_ALLOWED_CALLBACK_IPS, Value: !Ref MpesaAllowedCallbackIps }
+            - { Name: MPESA_SHORTCODE, Value: !Ref MpesaShortcode }
+            - { Name: MPESA_TRANSACTION_TYPE, Value: !Ref MpesaTransactionType }
+            - { Name: NOTIFY_EMAIL_ENABLED, Value: !Ref NotifyEmailEnabled }
+            - { Name: EMAIL_BACKEND, Value: django.core.mail.backends.smtp.EmailBackend }
+            - { Name: EMAIL_HOST, Value: !Sub "email-smtp.${AWS::Region}.amazonaws.com" }
+            - { Name: EMAIL_PORT, Value: "587" }
+            - { Name: DEFAULT_FROM_EMAIL, Value: !Ref DefaultFromEmail }
+          Secrets:
+            - { Name: DB_PASSWORD, ValueFrom: !Sub "${Database.MasterUserSecret.SecretArn}:password::" }
+            - { Name: DJANGO_SECRET_KEY, ValueFrom: !Sub "${AppSecret}:DJANGO_SECRET_KEY::" }
+            - { Name: FIELD_ENCRYPTION_KEYS, ValueFrom: !Sub "${AppSecret}:FIELD_ENCRYPTION_KEYS::" }
+            - { Name: MPESA_CONSUMER_KEY, ValueFrom: !Sub "${AppSecret}:MPESA_CONSUMER_KEY::" }
+            - { Name: MPESA_CONSUMER_SECRET, ValueFrom: !Sub "${AppSecret}:MPESA_CONSUMER_SECRET::" }
+            - { Name: MPESA_PASSKEY, ValueFrom: !Sub "${AppSecret}:MPESA_PASSKEY::" }
+            - { Name: EMAIL_HOST_USER, ValueFrom: !Sub "${AppSecret}:EMAIL_HOST_USER::" }
+            - { Name: EMAIL_HOST_PASSWORD, ValueFrom: !Sub "${AppSecret}:EMAIL_HOST_PASSWORD::" }
+            - { Name: AFRICASTALKING_API_KEY, ValueFrom: !Sub "${AppSecret}:AFRICASTALKING_API_KEY::" }
+            - { Name: WHATSAPP_TOKEN, ValueFrom: !Sub "${AppSecret}:WHATSAPP_TOKEN::" }
+            - { Name: TURNSTILE_SECRET_KEY, ValueFrom: !Sub "${AppSecret}:TURNSTILE_SECRET_KEY::" }
+            - { Name: MPESA_CALLBACK_TOKEN, ValueFrom: !Ref MpesaCallbackSecret }
+            - { Name: ORIGIN_VERIFY_SECRET, ValueFrom: !Ref OriginVerifySecret }
+  MigrateTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: propman-migrate
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !If [HasMigrateImage, !Ref MigrateImageUri, !Ref ImageUri]
+          Command: [migrate]
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options: { awslogs-group: !Ref LogGroup, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: migrate }
+          Environment:
+            - { Name: DJANGO_DEBUG, Value: "false" }
+            - { Name: DJANGO_ALLOWED_HOSTS, Value: !Ref DomainName }
+            - { Name: CSRF_TRUSTED_ORIGINS, Value: !Sub "https://${DomainName}" }
+            - { Name: FRONTEND_URL, Value: !Sub "https://${DomainName}" }
+            - { Name: SECURE_HTTPS, Value: "true" }
+            - { Name: NUM_PROXIES, Value: !Ref NumProxies }
+            - { Name: CACHE_BACKEND, Value: db }
+            - { Name: LOG_FORMAT, Value: json }
+            - { Name: DB_HOST, Value: !GetAtt Database.Endpoint.Address }
+            - { Name: DB_PORT, Value: !GetAtt Database.Endpoint.Port }
+            - { Name: DB_NAME, Value: propman }
+            - { Name: DB_USER, Value: propman }
+            - { Name: DB_SSL_REQUIRE, Value: "true" }
+            - { Name: STORAGE_BACKEND, Value: s3 }
+            - { Name: AWS_STORAGE_BUCKET_NAME, Value: !Ref MediaBucket }
+            - { Name: AWS_PRIVATE_BUCKET_NAME, Value: !Ref PrivateFilesBucket }
+            - { Name: AWS_S3_REGION_NAME, Value: !Ref AWS::Region }
+            - { Name: AWS_S3_CUSTOM_DOMAIN, Value: !Ref DomainName }
+            - { Name: MPESA_MODE, Value: !Ref MpesaMode }
+            - { Name: MPESA_CALLBACK_BASE_URL, Value: !Sub "https://${DomainName}" }
+            - { Name: MPESA_ALLOWED_CALLBACK_IPS, Value: !Ref MpesaAllowedCallbackIps }
+            - { Name: MPESA_SHORTCODE, Value: !Ref MpesaShortcode }
+            - { Name: MPESA_TRANSACTION_TYPE, Value: !Ref MpesaTransactionType }
+            - { Name: NOTIFY_EMAIL_ENABLED, Value: !Ref NotifyEmailEnabled }
+            - { Name: EMAIL_BACKEND, Value: django.core.mail.backends.smtp.EmailBackend }
+            - { Name: EMAIL_HOST, Value: !Sub "email-smtp.${AWS::Region}.amazonaws.com" }
+            - { Name: EMAIL_PORT, Value: "587" }
+            - { Name: DEFAULT_FROM_EMAIL, Value: !Ref DefaultFromEmail }
+          Secrets:
+            - { Name: DB_PASSWORD, ValueFrom: !Sub "${Database.MasterUserSecret.SecretArn}:password::" }
+            - { Name: DJANGO_SECRET_KEY, ValueFrom: !Sub "${AppSecret}:DJANGO_SECRET_KEY::" }
+            - { Name: FIELD_ENCRYPTION_KEYS, ValueFrom: !Sub "${AppSecret}:FIELD_ENCRYPTION_KEYS::" }
+            - { Name: MPESA_CONSUMER_KEY, ValueFrom: !Sub "${AppSecret}:MPESA_CONSUMER_KEY::" }
+            - { Name: MPESA_CONSUMER_SECRET, ValueFrom: !Sub "${AppSecret}:MPESA_CONSUMER_SECRET::" }
+            - { Name: MPESA_PASSKEY, ValueFrom: !Sub "${AppSecret}:MPESA_PASSKEY::" }
+            - { Name: EMAIL_HOST_USER, ValueFrom: !Sub "${AppSecret}:EMAIL_HOST_USER::" }
+            - { Name: EMAIL_HOST_PASSWORD, ValueFrom: !Sub "${AppSecret}:EMAIL_HOST_PASSWORD::" }
+            - { Name: AFRICASTALKING_API_KEY, ValueFrom: !Sub "${AppSecret}:AFRICASTALKING_API_KEY::" }
+            - { Name: WHATSAPP_TOKEN, ValueFrom: !Sub "${AppSecret}:WHATSAPP_TOKEN::" }
+            - { Name: TURNSTILE_SECRET_KEY, ValueFrom: !Sub "${AppSecret}:TURNSTILE_SECRET_KEY::" }
+            - { Name: MPESA_CALLBACK_TOKEN, ValueFrom: !Ref MpesaCallbackSecret }
+            - { Name: ORIGIN_VERIFY_SECRET, ValueFrom: !Ref OriginVerifySecret }
+
+  WebService:
+    Type: AWS::ECS::Service
+    DependsOn: HttpsListener
+    Properties:
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref WebTaskDefinition
+      DesiredCount: !Ref WebDesiredCount
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+          SecurityGroups: [!Ref AppSecurityGroup]
+      LoadBalancers: [{ ContainerName: app, ContainerPort: 8000, TargetGroupArn: !Ref TargetGroup }]
+  WorkerService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref WorkerTaskDefinition
+      DesiredCount: !Ref WorkerDesiredCount
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+          SecurityGroups: [!Ref AppSecurityGroup]
+
+  # ------------------------------------------------------------------ monitoring
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription: [{ Protocol: email, Endpoint: !Ref AlertEmail }]
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: API returning 5xx errors
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions: [{ Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+  UnhealthyTargetsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: No healthy API containers
+      Namespace: AWS/ApplicationELB
+      MetricName: HealthyHostCount
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+        - { Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName }
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      AlarmActions: [!Ref AlertTopic]
+  DbCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Database CPU high
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !Ref Database }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlertTopic]
+  DbStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Database free storage below 5 GB
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !Ref Database }]
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5000000000
+      ComparisonOperator: LessThanThreshold
+      AlarmActions: [!Ref AlertTopic]
+  WorkerErrorsMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref LogGroup
+      FilterPattern: '{ $.level = "ERROR" }'
+      MetricTransformations: [{ MetricNamespace: Propman, MetricName: AppErrors, MetricValue: "1", DefaultValue: 0 }]
+  AppErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Application logged errors (jobs, notifications, payments)
+      Namespace: Propman
+      MetricName: AppErrors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+Outputs:
+  CloudFrontDomain:
+    Value: !GetAtt Distribution.DomainName
+    Description: Point DomainName (CNAME / Route 53 alias) here
+  DistributionId:
+    Value: !Ref Distribution
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  MediaBucketName:
+    Value: !Ref MediaBucket
+  PrivateFilesBucketName:
+    Value: !Ref PrivateFilesBucket
+  ClusterName:
+    Value: !Ref Cluster
+  WebServiceName:
+    Value: !GetAtt WebService.Name
+  MigrateTaskDefinition:
+    Value: !Ref MigrateTaskDefinition
+  PrivateSubnets:
+    Value: !Join [",", [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+  AppSecurityGroup:
+    Value: !Ref AppSecurityGroup
+  AppSecretArn:
+    Value: !Ref AppSecret
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  MpesaCallbackUrlPattern:
+    Value: !Sub "https://${DomainName}/api/payments/mpesa/callback/<value of propman/mpesa-callback-token>/"

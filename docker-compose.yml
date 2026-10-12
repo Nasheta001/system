@@ -1,0 +1,65 @@
+# Production-like local stack: PostgreSQL + Django (gunicorn) + worker + nginx.
+#   1. copy deploy\docker.env.example deploy\docker.env  (or run scripts\docker-env.ps1)
+#   2. docker compose up --build
+#   3. open http://localhost:8080
+# This mirrors the AWS layout (CloudFront -> ALB -> ECS; RDS; worker service)
+# but runs over plain HTTP on your machine. It is NOT the AWS deployment.
+name: propman
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: propman
+      POSTGRES_USER: propman
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/docker.env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U propman -d propman"]
+      interval: 5s
+      retries: 10
+
+  migrate:
+    build: ./backend
+    command: ["migrate"]
+    env_file: deploy/docker.env
+    depends_on:
+      db: { condition: service_healthy }
+    restart: "no"
+
+  backend:
+    build: ./backend
+    command: ["web"]
+    env_file: deploy/docker.env
+    volumes:
+      - media:/data/media
+      - private_media:/data/private_media
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  worker:
+    build: ./backend
+    command: ["worker"]
+    healthcheck:
+      disable: true  # no HTTP server in the worker; liveness is the process itself
+    env_file: deploy/docker.env
+    volumes:
+      - media:/data/media
+      - private_media:/data/private_media
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "8080:8080"
+    volumes:
+      - media:/data/media:ro
+    depends_on:
+      backend: { condition: service_healthy }
+
+volumes:
+  pgdata:
+  media:
+  private_media:
